@@ -6,29 +6,31 @@ import pandas as pd
 import torch
 import cv2
 from torch.utils.data import Dataset
-from imgaug import augmenters as iaa
+import albumentations as A
 
 
 class ImgAugTransform:
     def __init__(self):
-        self.aug = iaa.Sequential([
-            iaa.OneOf([
-                iaa.Sometimes(0.25, iaa.AdditiveGaussianNoise(scale=0.1 * 255)),
-                iaa.Sometimes(0.25, iaa.GaussianBlur(sigma=(0, 3.0)))
-                ]),
-            iaa.Affine(
-                rotate=(-20, 20), mode="edge",
-                scale={"x": (0.95, 1.05), "y": (0.95, 1.05)},
-                translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)}
+        self.aug = A.Compose([
+            A.OneOf([
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.25),
+                A.GaussianBlur(blur_limit=(3, 7), p=0.25)
+            ], p=0.5),
+            A.Affine(
+                rotate=(-20, 20),
+                scale=(0.95, 1.05),
+                translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                mode=cv2.BORDER_REPLICATE,
+                p=1.0
             ),
-            iaa.AddToHueAndSaturation(value=(-10, 10), per_channel=True),
-            iaa.GammaContrast((0.3, 2)),
-            iaa.Fliplr(0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=10, val_shift_limit=0, p=1.0),
+            A.RandomGamma(gamma_limit=(30, 200), p=1.0),
+            A.HorizontalFlip(p=0.5),
         ])
 
     def __call__(self, img):
         img = np.array(img)
-        img = self.aug.augment_image(img)
+        img = self.aug(image=img)['image']
         return img
 
 

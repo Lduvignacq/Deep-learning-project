@@ -5,10 +5,13 @@ __pycache__/
 *.so
 .Python
 
-# Virtual Environment
+# Virtual Environment (seulement pour développement local)
 venv/
 env/
 ENV/
+
+# Google Colab
+.config/
 
 # Dataset (trop volumineux pour GitHub)
 appa-real-release/
