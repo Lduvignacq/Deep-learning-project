@@ -196,6 +196,10 @@ def main():
     best_val_mae = 10000.0
     train_writer = None
 
+    # Initialisation du CSV pour sauvegarder les métriques
+    metrics_file = checkpoint_dir.joinpath("training_metrics.csv")
+    metrics_data = []
+
     if args.tensorboard is not None:
         opts_prefix = "_".join(args.opts)
         train_writer = SummaryWriter(log_dir=args.tensorboard + "/" + opts_prefix + "_train")
@@ -207,6 +211,18 @@ def main():
 
         # validate
         val_loss, val_acc, val_mae = validate(val_loader, model, criterion, epoch, device)
+
+        # Sauvegarde des métriques dans une liste
+        current_lr = optimizer.param_groups[0]['lr']
+        metrics_data.append({
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'val_mae': val_mae,
+            'learning_rate': current_lr
+        })
 
         if args.tensorboard is not None:
             train_writer.add_scalar("loss", train_loss, epoch)
@@ -234,6 +250,12 @@ def main():
 
         # adjust learning rate
         scheduler.step()
+
+    # Sauvegarde des métriques dans un fichier CSV
+    import pandas as pd
+    df_metrics = pd.DataFrame(metrics_data)
+    df_metrics.to_csv(metrics_file, index=False)
+    print(f"=> Métriques sauvegardées dans {metrics_file}")
 
     print("=> training finished")
     print(f"additional opts: {args.opts}")
