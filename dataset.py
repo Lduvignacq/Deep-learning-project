@@ -13,14 +13,13 @@ class ImgAugTransform:
     def __init__(self):
         self.aug = A.Compose([
             A.OneOf([
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.25),
+                A.GaussNoise(p=0.25),
                 A.GaussianBlur(blur_limit=(3, 7), p=0.25)
             ], p=0.5),
             A.Affine(
                 rotate=(-20, 20),
                 scale=(0.95, 1.05),
                 translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
-                mode=cv2.BORDER_REPLICATE,
                 p=1.0
             ),
             A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=10, val_shift_limit=0, p=1.0),
