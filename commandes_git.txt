@@ -1,0 +1,39 @@
+COMMANDES GIT ESSENTIELLES (pull / push)
+
+1. Vérifier l’état du dossier
+   git status
+
+2. Ajouter tous les fichiers modifiés
+   git add .
+
+3. Créer le commit
+   git commit -m "Description des modifications"
+
+4. Récupérer les changements des autres (toujours avant push)
+   git pull origin master
+   (ou git pull origin main si la branche principale est main)
+
+5. Envoyer tes modifications sur GitHub
+   git push origin master
+   (ou git push origin main)
+
+
+COMMANDES UTILES EN CAS DE PROBLÈME
+
+• Si le pull bloque ou si divergence :
+  git pull --rebase origin master
+
+• Retirer un fichier ajouté par erreur :
+  git restore --staged nom_fichier
+
+• Annuler des modifications locales (revient à la version Git) :
+  git restore nom_fichier
+
+
+VERSION ULTRA-RÉSUMÉE (à utiliser tous les jours)
+
+git status
+git add .
+git commit -m "update"
+git pull origin master
+git push origin master
