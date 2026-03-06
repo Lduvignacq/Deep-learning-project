@@ -1,7 +1,7 @@
 # DL-DIY potential project ideas
 - pose this problem as regression or classification and compare them
 - implementing the [DEX method](http://people.ee.ethz.ch/~timofter/publications/Rothe-IJCV-2016.pdf) and [Residual DEX method](http://people.ee.ethz.ch/~timofter/publications/Agustsson-FG-2017.pdf)
-- implement and test [label smoothing](https://towardsdatascience.com/what-is-label-smoothing-108debd7ef06) for classification
+- implement and test [label smoothing](httpsx://towardsdatascience.com/what-is-label-smoothing-108debd7ef06) for classification
 - use [Gaussian/Laplace likelihood loss (aleatoric loss)](https://arxiv.org/abs/1703.04977) for regression having the variance as a network parameter (homoscedastic) or prediction from the input sample (heteroscedastic)
 - find strategies for dealing with imbalanced data
 - use other attributes from extended [APPA-REAL dataset](http://chalearnlap.cvc.uab.es/dataset/26/description/), e.g. ethnic, makeup, gender, expression, to train in a multi-task setting
