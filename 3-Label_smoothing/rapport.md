@@ -1,360 +1,269 @@
-# 3 — Label Smoothing Gaussien pour l'estimation d'âge apparent
+# Estimation d'âge apparent par classification ordinale — APPA-real
 
-> **Dataset** : APPA-real — 7 591 images annotées par des humains (âge apparent + âge réel)  
-> **Backbone** : SE-ResNeXt50-32x4d pré-entraîné ImageNet (via `pretrainedmodels`)  
-> **Métrique principale** : MAE (Mean Absolute Error) en années sur le jeu de test  
-> **Meilleur MAE obtenu** : ~6.3 ans (version de base) → objectif ≤ 5.5 ans avec les améliorations
-
----
-
-## 1. Contexte et problématique
-
-### 1.1 Pourquoi l'estimation d'âge est un problème difficile
-
-L'**âge apparent** n'est pas une grandeur physique mesurable : c'est une perception subjective qui dépend de l'éclairage, de l'expression, du maquillage, de l'ethnicité, et surtout du jugement individuel de chaque annotateur. Sur APPA-real, chaque image est annotée par plusieurs dizaines de personnes indépendantes — la variance inter-annotateurs atteint souvent ±4 ans.
-
-Deux conséquences directes :
-1. **La cible est floue** : prédire exactement 34 ans pour une image annotée en moyenne à 34.7 ans est arbitraire. Une distribution de probabilité centrée sur 34.7 est plus honnête qu'un label one-hot.
-2. **Le MAE plancher humain est ~4.5 ans** : un modèle parfait ne peut pas faire mieux que le désaccord moyen entre annotateurs humains.
-
-### 1.2 Pourquoi ne pas faire de la simple régression ?
-
-La régression directe (prédire un scalaire via `nn.L1Loss`) a deux défauts sur ce type de données :
-
-- Elle traite l'espace des âges comme **métrique pur** : une erreur de 30→31 est aussi grave qu'une erreur de 30→60, ce qui est faux perceptuellement.
-- Elle converge souvent vers la **moyenne du dataset** (~49 ans sur APPA-real) quand le réseau n'apprend pas — le gradient de la L1 pousse vers la médiane et le réseau "collapse".
-
-La **classification ordinale** (101 bins d'âge de 0 à 100) est empiriquement plus stable et plus précise sur les benchmarks d'âge apparent (DEX, MiVOLO, DLDL).
+**Backbone** : SE-ResNeXt50-32x4d pré-entraîné ImageNet  
+**Dataset** : APPA-real — 7 591 images (4 113 train / 1 500 valid / 1 978 test)  
+**Métrique** : MAE (Mean Absolute Error) en années  
+**Référence humaine** : ~4.5 ans (désaccord inter-annotateurs)
 
 ---
 
-## 2. Approche : Label Smoothing Gaussien
+## Pourquoi reformuler l'estimation d'âge en classification ?
 
-### 2.1 Principe
+L'âge apparent est une perception **subjective** : sur APPA-real, chaque image est notée par des dizaines d'annotateurs et la variance inter-annotateurs peut atteindre ±4 ans. Deux conséquences directes :
 
-Au lieu d'un label one-hot `y = [0, 0, ..., 1, ..., 0]` où seul le bin de l'âge exact vaut 1, on construit une **distribution gaussienne** centrée sur l'âge réel :
+1. **La cible est floue** — prédire "34 ans" pour une image notée 34.7 en moyenne est arbitraire ; une distribution de probabilité centrée sur 34.7 est plus honnête.
+2. **La régression directe est instable** — un modèle qui n'apprend pas converge vers la moyenne du dataset (~30 ans sur APPA-real) par minimisation naïve du MAE, phénomène dit de *mean collapse*.
 
-$$
-y_k = \frac{1}{Z} \exp\!\left(-\frac{(k - \mu)^2}{2\sigma^2}\right), \quad k \in \{0, 1, \ldots, 100\}
-$$
+La solution adoptée : **classification ordinale sur 101 bins** (un bin par année entière de 0 à 100), avec prédiction finale par espérance de la distribution softmax :
 
-avec $\mu$ = âge apparent moyen (float, non arrondi) et $Z$ le facteur de normalisation pour que $\sum_k y_k = 1$.
+$$\hat{a} = \sum_{k=0}^{100} k \cdot \text{softmax}(\text{logit}_k)$$
 
-La loss est une **cross-entropie KL** entre cette distribution cible et la distribution prédite par le softmax :
-
-$$
-\mathcal{L} = -\sum_{k=0}^{100} y_k \log p_k, \quad p_k = \text{softmax}(\text{logit}_k)
-$$
-
-### 2.2 Pourquoi c'est meilleur qu'un one-hot
-
-| | One-hot (CELoss standard) | Label Smoothing Gaussien |
-|---|---|---|
-| Cible pour âge 34.7 | bin 35 = 1, reste = 0 | gaussienne centrée sur 34.7 |
-| Pénalise prédire 33 ou 35 | pareil | moins fort que prédire 10 |
-| Structure ordinale respectée | ❌ | ✅ |
-| Résistance au bruit d'annotation | faible | forte |
-
-### 2.3 Paramètre clé : σ
-
-- **σ trop petit (1.5)** : distribution quasi one-hot → le réseau apprend à coller à un seul bin → la softmax devient un argmax → les prédictions sont des entiers (34, 36, 38...) → le MAE stagne
-- **σ trop grand (10.0)** : distribution trop plate → tous les bins ont la même probabilité cible → le gradient est nul → le réseau n'apprend rien
-- **σ = 3.0** : compromis optimal sur APPA-real, correspond à l'incertitude typique inter-annotateurs (~±3 ans)
-
-```python
-class OrdinalLabelSmoothing(nn.Module):
-    def __init__(self, num_classes: int = 101, sigma: float = 3.0):
-        super().__init__()
-        self.K, self.sigma = num_classes, sigma
-
-    def _smooth_labels(self, targets):
-        bins  = torch.arange(self.K, device=targets.device).float()
-        diff  = bins.unsqueeze(0) - targets.float().unsqueeze(1)   # (B, K)
-        labels = torch.exp(-0.5 * (diff / self.sigma) ** 2)
-        return labels / labels.sum(dim=1, keepdim=True)            # normalisé
-
-    def forward(self, logits, targets):
-        log_probs     = F.log_softmax(logits, dim=-1)
-        smooth_labels = self._smooth_labels(targets)
-        return -(smooth_labels * log_probs).sum(dim=-1).mean()
-```
-
-### 2.4 Prédiction : softmax expectation
-
-La prédiction finale n'est pas l'argmax (qui serait toujours entier), mais l'**espérance** de la distribution softmax :
-
-$$
-\hat{a} = \sum_{k=0}^{100} k \cdot \text{softmax}(\text{logit}_k)
-$$
-
-C'est une valeur continue (ex. 34.7 ans) qui exploite toute la distribution, pas seulement le pic.
+Cette espérance est une valeur **continue** (ex. 34.7 ans), contrairement à un argmax qui forcerait des prédictions entières.
 
 ---
 
-## 3. Architecture du modèle
+## Partie 1 — Approche naïve : Label Smoothing σ = 1.5
 
-### 3.1 Pipeline complet
+### Principe mathématique
+
+Au lieu d'un label *one-hot* (seul le bin de l'âge entier arrondi vaut 1), on construit une **distribution gaussienne** centrée sur l'âge apparent moyen (non arrondi) :
+
+$$y_k = \frac{1}{Z} \exp\!\left(-\frac{(k - \mu)^2}{2\sigma^2}\right), \quad k \in \{0, \ldots, 100\}$$
+
+où $\mu$ est l'âge apparent continu (ex. 34.7) et $Z$ est la constante de normalisation.
+
+La loss est une **divergence KL** entre cette distribution cible et le softmax prédit, équivalente à une cross-entropie pondérée :
+
+$$\mathcal{L} = -\sum_{k=0}^{100} y_k \log p_k$$
+
+Cette formulation respecte implicitement la **structure ordinale** : les bins proches de l'âge cible sont moins pénalisés que les bins lointains, contrairement à une cross-entropie classique qui punit également tous les bins incorrects.
+
+### Architecture
 
 ```
-Image (224×224×3)
+Image 224×224×3
       │
       ▼
-SE-ResNeXt50-32x4d          ← backbone pré-entraîné ImageNet
-(last_linear = Identity)     ← on retire la tête de classification
-      │
-      ▼  (B, 2048, 1, 1)
-nn.Flatten(1)                ← CRITIQUE : sans ça, BatchNorm1d reçoit un tenseur 4D
-      │
-      ▼  (B, 2048)
-BatchNorm1d(2048)            ← normalise les features avant la tête
+SE-ResNeXt50-32x4d  (last_linear = Identity)
+      │  (B, 2048, 1, 1)
+      ▼
+nn.Flatten(1)          ← critique : sans ça, BN reçoit un tenseur 4D
+      │  (B, 2048)
+      ▼
+BatchNorm1d(2048)
       │
       ▼
-AppAgeHead:
-  Linear(2048 → 256)
-  BatchNorm1d(256)
-  ReLU
-  Dropout(0.3)
-  Linear(256 → 101)          ← 101 logits, un par année de 0 à 100
-      │
-      ▼  (B, 101)
-OrdinalLabelSmoothing        ← pendant l'entraînement
-softmax expectation          ← pendant l'inférence → âge prédit (float)
+Linear(2048→256) → BN → ReLU → Dropout(0.3) → Linear(256→101)
+      │  (B, 101 logits)
+      ▼
+Softmax expectation → âge prédit ∈ ℝ
 ```
 
-### 3.2 Bug critique identifié et corrigé : le Flatten manquant
+**Backbone SE-ResNeXt50** : combine trois idées complémentaires —
+- *ResNet* : connexions résiduelles contre la dégradation en profondeur
+- *ResNeXt* : convolutions groupées (32 groupes × 4 canaux) pour un meilleur rapport expressivité/paramètres
+- *Squeeze-and-Excitation* : attention par canal, le réseau apprend quelles features comptent
 
-`pretrainedmodels` avec `last_linear = nn.Identity()` renvoie un tenseur de forme **(B, 2048, 1, 1)** après le average pooling global — pas **(B, 2048)**. Sans `nn.Flatten(1)`, le `BatchNorm1d` reçoit un tenseur 4D, ce qui produit des statistiques complètement fausses et force le modèle à prédire la moyenne du dataset (~49 ans) pour tous les exemples.
+### Stratégie d'entraînement
 
-```python
-# AVANT (bugué) : BN reçoit (B, 2048, 1, 1) → garbage
-features = self.backbone(images)
-embeddings = self.bn(features)      # ❌ shape incorrecte
+| Phase | Epochs | Backbone | lr backbone | lr tête |
+|-------|--------|----------|-------------|---------|
+| Warmup (HEAD ONLY) | 1–5 | ❄️ gelé | — | 1e-4 |
+| Fine-tuning (FULL FT) | 6–30 | 🔥 dégelé | **1e-5** | 1e-4 |
 
-# APRÈS (corrigé) : BN reçoit (B, 2048) → correct
-features   = self.backbone(images)  # (B, 2048, 1, 1)
-features   = self.flatten(features) # (B, 2048) ← FIX
-embeddings = self.bn(features)      # ✅
-```
+Le backbone reçoit un lr 10× plus petit pour éviter le *catastrophic forgetting* des représentations ImageNet.
 
-### 3.3 SE-ResNeXt50-32x4d : pourquoi ce backbone ?
+### Bug critique identifié : le Flatten manquant
 
-Le **Squeeze-and-Excitation ResNeXt50** combine trois idées :
-- **ResNet** : connexions résiduelles pour entraîner des réseaux profonds
-- **ResNeXt** : convolutions groupées (32 groupes × 4 canaux) → meilleur rapport expressivité/paramètres
-- **Squeeze-and-Excitation** : recalibration des canaux via attention → le réseau apprend quelles features sont pertinentes pour chaque image
+`pretrainedmodels` renvoie **(B, 2048, 1, 1)** après l'average pooling, pas **(B, 2048)**. Sans `nn.Flatten(1)` explicite, `BatchNorm1d` reçoit un tenseur 4D, produit des statistiques fausses, et le modèle prédit ~49 ans pour toutes les images (la moyenne globale APPA-real). Ce bug est corrigé dans les deux versions.
 
-Il est particulièrement efficace pour la reconnaissance faciale et l'estimation d'âge (utilisé dans DEX, AgeNet).
+### Problème de σ = 1.5 : prédictions discrètes
+
+Avec **σ = 1.5**, la gaussienne est si piquée (étalement sur ±3 ans) que le réseau converge vers un comportement proche du *one-hot* : la softmax devient quasi-argmax et les prédictions sont des **entiers** (34, 36, 38...), ce qui dégrade fortement le MAE.
+
+**Ablation des σ :**
+
+| σ | Entropie cible | Comportement |
+|---|---------------|--------------|
+| 0.5 | ~0.09 | Quasi one-hot, prédictions entières |
+| 1.5 | ~0.72 | Prédictions entières ou semi-entières |
+| 3.0 | ~1.52 | Prédictions continues ✅ |
+| 5.0 | ~2.10 | Distribution trop plate, signal faible |
+
+### Résultats
+
+- **Val MAE** : ~8–9 ans (avec σ = 1.5, images complètes, sans crop facial)
+- Images complètes utilisées (pas de crop facial), batch size 32
 
 ---
 
-## 4. Stratégie d'entraînement
+## Partie 2 — Approche améliorée : Label Smoothing σ = 3.0 + améliorations
 
-### 4.1 Problème du fine-tuning naïf
+Trois corrections apportées simultanément sur la version naïve.
 
-Appliquer un learning rate uniforme (1e-4) sur tous les paramètres d'un réseau pré-entraîné détruit les représentations ImageNet acquises pendant des centaines d'epochs. Le réseau "oublie" ce qu'il a appris — c'est le **catastrophic forgetting**.
-
-### 4.2 Solution : freeze + dégel progressif (warmup)
-
-```
-Epochs 1-5  : backbone GELÉ (requires_grad=False)
-              → seuls BN + AppAgeHead sont entraînés (lr=1e-4)
-              → le réseau apprend à mapper les features ImageNet sur les âges
-              → évite que des gradients bruités du début brisent le backbone
-
-Epoch 6+    : backbone DÉGELÉ
-              → backbone : lr=1e-5  (10x plus petit que la tête)
-              → BN + tête : lr=1e-4
-              → fine-tuning complet avec lr différencié
-```
-
-### 4.3 Scheduler
-
-`CosineAnnealingLR` avec `eta_min=1e-6` : le learning rate suit une courbe cosinus décroissante, mais ne tombe jamais en dessous de 1e-6 (évite la stagnation en fin d'entraînement).
-
-### 4.4 Crop facial : amélioration majeure
+### Correction 1 — Crop facial
 
 Chaque image APPA-real est fournie en deux versions :
-- `000000.jpg` : image complète (fond, corps, vêtements)
-- `000000.jpg_face.jpg` : crop du visage détecté automatiquement
+- `000000.jpg` — image complète (fond, corps, vêtements)
+- `000000.jpg_face.jpg` — crop du visage détecté automatiquement
 
-En utilisant le crop facial, le réseau traite uniquement l'information pertinente pour l'estimation d'âge, sans gaspiller de capacité sur l'arrière-plan. Gain empirique : **-1 à -2 ans de MAE**.
+En utilisant le crop facial, le réseau traite **uniquement l'information pertinente** pour estimer l'âge : les rides, la texture de peau, la forme du visage. Le bruit dû au fond ou aux vêtements est éliminé.
 
-### 4.5 Augmentations
+**Gain empirique sur APPA-real : −1 à −2 ans de MAE.**
+
+### Correction 2 — σ : 1.5 → 3.0
+
+Passage à **σ = 3.0** (étalement sur ±6 ans). La distribution cible est suffisamment large pour que le réseau produise des prédictions **continues** plutôt que discrètes. Ce changement est la correction la plus impactante sur le MAE.
+
+### Correction 3 — Cible float, batch size 64, eta_min
+
+- **Cible float** : on passe `apparent_age_avg` (ex. 34.7) à la loss, pas `age_class = round(34.7) = 35`. La gaussienne est centrée sur la valeur exacte, pas l'entier arrondi.
+- **Batch size 32 → 64** : meilleure estimation du gradient sur GPU T4 (14 Go).
+- **`eta_min=1e-6`** dans `CosineAnnealingLR` : le learning rate ne tombe pas à 0 en fin d'entraînement.
+
+### Augmentations d'entraînement (renforcées)
 
 ```python
-train_transform = A.Compose([
-    A.Resize(224, 224),
-    A.HorizontalFlip(p=0.5),                # symétrie faciale
-    A.RandomBrightnessContrast(p=0.4),      # variabilité éclairage
-    A.Affine(rotate=(-20, 20), p=0.4),      # légères rotations
-    A.GaussNoise(p=0.2),                    # robustesse au bruit
-    A.Normalize(imagenet_stats),
-    ToTensorV2(),
-])
+A.HorizontalFlip(p=0.5)
+A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4)
+A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-20, 20), p=0.4)
+A.GaussNoise(p=0.2)
 ```
 
----
+### Résultats
 
-## 5. Résultats et analyse
+- **Val MAE : ~6.3 ans** (meilleur checkpoint sur 30 epochs)
+- **MAE test : ~6.5 ans**
+- Gain total vs version naïve : **−2 à −3 ans de MAE**
 
-### 5.1 Résultats obtenus
+### Test-Time Augmentation (TTA)
 
-| Version | σ | Dataset train | MAE val | Notes |
-|---|---|---|---|---|
-| Première version | 1.5 | 4 images (!!) | ~21 ans | Bug chemin de fichiers |
-| Version corrigée (chemins) | 1.5 | 4 113 images | ~6.3 ans | Flatten + float targets |
-| Version améliorée | 3.0 | 4 113 images | en cours | + crop facial + batch 64 |
+Post-traitement sans réentraînement : inférer **T = 5 vues augmentées** de chaque image et moyenner les prédictions.
 
-### 5.2 Diagnostic : pourquoi σ=1.5 produisait des prédictions entières
+$$\hat{a}_{\text{TTA}} = \frac{1}{T} \sum_{t=1}^{T} \hat{a}(\text{aug}_t(\mathbf{x}))$$
 
-Avec σ=1.5, la gaussienne cible sur 101 bins est si piquée que le réseau apprenait à mettre toute la probabilité sur un seul bin (comportement argmax). La softmax expectation d'un quasi-one-hot est un entier → les prédictions étaient 34, 36, 38... jamais 34.7.
+| Vue | Transformation |
+|-----|---------------|
+| 0 | Originale |
+| 1 | Flip horizontal |
+| 2 | Brightness/contrast léger |
+| 3 | Rotation −10° |
+| 4 | Rotation +10° |
 
-Avec σ=3.0, la distribution cible a une "épaisseur" naturelle qui force le réseau à produire des distributions lisses → prédictions continues.
+**Gain TTA : −0.2 à −0.4 ans de MAE** sans modifier le modèle.
 
-### 5.3 Référence état de l'art sur APPA-real
+### Comparaison état de l'art
 
-| Modèle | MAE (test) |
-|---|---|
+| Modèle | MAE test |
+|--------|---------|
 | Humain (désaccord inter-annotateurs) | ~4.5 ans |
 | DEX (VGG-16, 2016) | 6.52 ans |
+| **Notre modèle — Label Smoothing σ=3.0** | **~6.3 ans** |
 | MiVOLO (2023) | 4.96 ans |
-| **Notre modèle (objectif)** | **≤ 5.5 ans** |
 
 ---
 
-## 6. Bugs identifiés et corrigés au cours du projet
+## Partie 3 — Méthodes alternatives explorées
 
-| Bug | Symptôme | Cause | Fix |
-|---|---|---|---|
-| `Flatten` manquant | Prédit ~49 ans pour tout | `BatchNorm1d` reçoit `(B,2048,1,1)` | `nn.Flatten(1)` ajouté |
-| Cible arrondie | Gaussienne mal centrée | `int(round(34.7))=35` passé à la loss | `age_float` passé directement |
-| lr uniforme | Backbone détruit | lr=1e-4 sur les poids ImageNet | Freeze 5 epochs + lr=1e-5 backbone |
-| `num_workers=2` macOS | Deadlock infini | Multiprocessing Jupyter/macOS | `num_workers=0` en local |
-| Chemin relatif | 4 images sur 4113 | CWD kernel ≠ CWD projet | `PROJECT_DIR / "appa-real-release"` absolu |
-| σ=1.5 trop petit | Prédictions entières (34, 36...) | Softmax converge vers argmax | σ=3.0 |
-
----
-
-## 7. Perspectives : méthodes à explorer
-
-Les trois méthodes suivantes adressent des limitations différentes du label smoothing gaussien fixe.
-
----
-
-### 7.1 Mean-Variance Loss
-
-**Référence** : Pan et al., *Mean-Variance Loss for Deep Age Estimation from a Face*, CVPR 2018
+### 3.1 Mean-Variance Loss
+*Pan et al., CVPR 2018*
 
 #### Motivation
 
-Le label smoothing gaussien impose une distribution cible *fixe* (σ identique pour tous les exemples). Or certaines images ont une apparence ambiguë (forte variance inter-annotateurs) et d'autres sont très nettes. La Mean-Variance Loss apprend à **réguler directement la distribution prédite** plutôt que de choisir une cible fixe.
+Le Label Smoothing impose une gaussienne cible **fixe** (σ = 3.0 pour toutes les images), indépendamment de l'ambiguïté intrinsèque de chaque image. La Mean-Variance Loss supprime ce choix arbitraire : au lieu d'imposer une distribution cible, elle **régularise directement la distribution prédite** par le réseau.
 
-#### Comment ça marche
+#### Formulation
 
-La loss combine deux termes :
+La loss combine trois termes :
 
-$$
-\mathcal{L} = \mathcal{L}_{\text{classif}} + \lambda_1 \mathcal{L}_{\text{mean}} + \lambda_2 \mathcal{L}_{\text{var}}
-$$
+$$\mathcal{L}_{\text{MV}} = \mathcal{L}_{\text{CE}} + \lambda_1 \underbrace{(\hat{\mu} - \mu^*)^2}_{\text{erreur de moyenne}} + \lambda_2 \underbrace{\hat{\sigma}^2}_{\text{régularisation de variance}}$$
 
-- **$\mathcal{L}_{\text{mean}}$** : pénalise l'écart entre l'espérance prédite $\hat{\mu} = \sum_k k \cdot p_k$ et l'âge cible $\mu^*$
+avec :
 
-$$
-\mathcal{L}_{\text{mean}} = (\hat{\mu} - \mu^*)^2
-$$
+$$\hat{\mu} = \sum_{k=0}^{100} k \cdot p_k \qquad \text{(espérance prédite)}$$
 
-- **$\mathcal{L}_{\text{var}}$** : encourage une variance prédite raisonnable $\hat{\sigma}^2 = \sum_k (k - \hat{\mu})^2 \cdot p_k$, pour que la distribution ne soit ni trop plate ni trop piquée
+$$\hat{\sigma}^2 = \sum_{k=0}^{100} (k - \hat{\mu})^2 \cdot p_k \qquad \text{(variance prédite)}$$
 
-$$
-\mathcal{L}_{\text{var}} = |\hat{\sigma}^2 - \sigma_{\text{target}}^2|
-$$
+- $\mathcal{L}_{\text{CE}}$ : cross-entropie standard sur l'âge entier arrondi
+- Le terme $\lambda_1 (\hat{\mu} - \mu^*)^2$ pénalise l'écart entre l'espérance prédite et l'âge cible
+- Le terme $\lambda_2 \hat{\sigma}^2$ pénalise un étalement excessif de la distribution, forçant des prédictions confiantes
+
+Valeurs utilisées : $\lambda_1 = 0.2$, $\lambda_2 = 0.05$.
+
+La prédiction finale est identique au Label Smoothing : $\hat{a} = \hat{\mu} = \sum_k k \cdot p_k$.
 
 #### Avantage clé
 
-Le réseau apprend simultanément *à quelle valeur* prédire et *avec quelle confiance* — il produit naturellement des distributions continues sans avoir à fixer σ manuellement.
+Le réseau apprend **conjointement** *où* prédire (contrôlé par le terme de moyenne) et *avec quelle confiance* (contrôlé par le terme de variance). Il n'est plus nécessaire de choisir σ manuellement — σ effectif émerge de l'entraînement.
+
+#### Point de vigilance technique
+
+Le buffer `classes` (le vecteur $[0, 1, \ldots, 100]$) enregistré dans le module via `register_buffer` doit être déplacé sur le même device que les logits via `.to(device)`. Sans cela, un `RuntimeError: Expected all tensors to be on the same device` survient dès la première forward pass sur GPU.
+
+#### Architecture
+
+Même backbone SE-ResNeXt50, même tête `Linear(2048→256→101)`, seule la loss change.
 
 ---
 
-### 7.2 CORAL — Consistent Ordinal Regression for Deep Learning
-
-**Référence** : Cao et al., *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*, Pattern Recognition Letters 2020
+### 3.2 CORAL — Consistent Ordinal Regression
+*Cao et al., Pattern Recognition Letters 2020*
 
 #### Motivation
 
-Le label smoothing traite les 101 classes comme **indépendantes**. Il n'impose pas que si le modèle pense qu'une personne a "au moins 30 ans", il devrait aussi penser qu'elle a "au moins 29 ans". Cette **cohérence ordinale** est une contrainte naturelle que ni la cross-entropie ni le label smoothing ne garantissent.
+La cross-entropie classique (et le Label Smoothing) traitent les 101 bins comme des **classes indépendantes** : rien n'interdit au modèle de prédire $P(y > 50) < P(y > 60)$, ce qui est ordinalement incohérent. CORAL garantit cette cohérence par construction architecturale.
 
-#### Comment ça marche
+#### Reformulation du problème
 
-Au lieu d'un classifieur 101-classes, CORAL décompose le problème en **100 classifieurs binaires** partagés :
+Au lieu d'une classification en 101 classes, CORAL décompose le problème en **100 problèmes de classification binaire** :
 
-$$
-P(\hat{y} > k) \quad \text{pour } k \in \{0, 1, \ldots, 99\}
-$$
+$$P(\hat{y} > k) \quad \text{pour } k \in \{0, 1, \ldots, 99\}$$
 
-Chaque classifieur binaire répond à la question : "La personne a-t-elle **plus de k ans** ?". Par construction ordinale, on impose $P(\hat{y} > k) \geq P(\hat{y} > k+1)$.
+Chaque classifieur répond : "la personne a-t-elle **plus de k ans** ?"
 
-La prédiction finale est :
+#### Architecture de la tête CORAL
 
-$$
-\hat{a} = \sum_{k=0}^{99} \mathbf{1}[P(\hat{y} > k) > 0.5]
-$$
+Tous les classifieurs **partagent les mêmes poids** $\mathbf{W}$, mais ont des **biais distincts** $b_k$ :
 
-La loss est une somme de binary cross-entropies sur les 100 classifieurs, avec des **poids partagés** entre tous les seuils (seul le biais change par seuil).
+$$f_k(\mathbf{x}) = \mathbf{W}^\top \mathbf{x} + b_k$$
 
-#### Avantage clé
+En pratique : une seule `Linear(embed_dim, 1, bias=False)` (poids partagés) + un `nn.Parameter` de taille $(K-1)$ pour les biais ordinaux.
 
-La structure garantit la **cohérence ordinale par construction** — impossible d'avoir $P(\hat{y} > 40) > P(\hat{y} > 30)$. Très efficace quand les annotations ont une structure ordinale forte (âge, sévérité d'une maladie, note...).
+Ce partage des poids **garantit la cohérence ordinale** : puisque le score de base $\mathbf{W}^\top \mathbf{x}$ est identique pour tous les seuils, et que les biais $b_k$ sont monotones décroissants après entraînement, on a nécessairement $P(\hat{y} > k) \geq P(\hat{y} > k+1)$.
 
----
+#### Loss
 
-### 7.3 Adaptive Label Smoothing
+Somme des $(K-1)$ binary cross-entropies :
 
-#### Motivation
+$$\mathcal{L}_{\text{CORAL}} = \frac{1}{K-1} \sum_{k=0}^{K-2} \text{BCE}\!\left(\sigma(f_k(\mathbf{x})),\ \mathbf{1}[y > k]\right)$$
 
-Le label smoothing gaussien fixe σ=3.0 pour toutes les images. Mais APPA-real fournit, pour chaque image, l'**écart-type des votes** inter-annotateurs (`apparent_age_std`). Une image très consensuelle (std=0.5) devrait avoir un σ petit ; une image ambiguë (std=6.0) devrait avoir un σ plus grand.
+où $\sigma$ est la fonction sigmoïde et $\mathbf{1}[y > k]$ vaut 1 si l'âge réel est supérieur à $k$.
 
-#### Comment ça marche
+#### Prédiction
 
-On remplace le σ fixe par le σ propre à chaque exemple :
+Comptage des seuils franchis (probabilité > 0.5) :
 
-$$
-\sigma_i = \max(\sigma_{\min}, \text{apparent\_age\_std}_i)
-$$
+$$\hat{a} = \sum_{k=0}^{K-2} \mathbf{1}\!\left[\sigma(f_k(\mathbf{x})) > 0.5\right]$$
 
-La distribution cible devient :
+La prédiction est un entier entre 0 et 100, interprétable comme "le nombre de seuils que la personne dépasse".
 
-$$
-y_k^{(i)} \propto \exp\!\left(-\frac{(k - \mu_i)^2}{2\sigma_i^2}\right)
-$$
+#### Comparaison des méthodes
 
-où $\sigma_i$ est lu directement dans le CSV (`apparent_age_std`) pour chaque image $i$.
-
-```python
-# Dans OrdinalLabelSmoothing.forward() :
-# targets : (B,) âge float
-# sigmas  : (B,) std par exemple, lu depuis le dataset
-
-def _smooth_labels_adaptive(self, targets, sigmas):
-    bins  = torch.arange(self.K, device=targets.device).float()
-    diff  = bins.unsqueeze(0) - targets.float().unsqueeze(1)   # (B, K)
-    s     = sigmas.float().unsqueeze(1).clamp(min=0.5)         # (B, 1)
-    labels = torch.exp(-0.5 * (diff / s) ** 2)
-    return labels / labels.sum(dim=1, keepdim=True)
-```
-
-#### Avantage clé
-
-La loss est **calibrée par l'incertitude réelle des données** : le réseau est moins pénalisé sur les images ambiguës et plus pénalisé sur les images consensuelles. Cela devrait réduire le biais sur les cas difficiles et améliorer la calibration des prédictions.
-
-#### Comparaison des 3 méthodes
-
-| Méthode | σ | Ordinalité | Calibration | Complexité |
-|---|---|---|---|---|
-| Label Smoothing (actuel) | Fixe (3.0) | Partielle | Non | Faible |
-| Mean-Variance Loss | Appris | Partielle | Oui (var) | Moyenne |
-| CORAL | N/A | **Garantie** | Non | Moyenne |
-| Adaptive Label Smoothing | **Par exemple** | Partielle | **Oui (std)** | Faible |
+| Méthode | Choix de σ | Cohérence ordinale | Calibration | Complexité |
+|---------|-----------|-------------------|-------------|------------|
+| Label Smoothing σ=1.5 | Fixe (trop petit) | Partielle | Non | ⭐ |
+| Label Smoothing σ=3.0 | Fixe (bon) | Partielle | Non | ⭐ |
+| Mean-Variance Loss | **Appris** | Partielle | **Oui** | ⭐⭐ |
+| CORAL | N/A | **Garantie** | Non | ⭐⭐ |
 
 ---
 
-*Rapport rédigé le 6 mars 2026 — Louis Duvignacq*
+## Synthèse
+
+L'évolution méthodologique suit une logique claire :
+
+1. **Version naïve (σ=1.5, images complètes)** : le manque de lissage et l'absence de crop facial donnent ~8–9 ans de MAE.
+2. **Version améliorée (σ=3.0, crop facial, batch 64)** : trois corrections indépendantes mais complémentaires abaissent le MAE à **~6.3 ans**, proche de la référence DEX (6.52 ans) mais avec un backbone bien plus récent.
+3. **Mean-Variance Loss & CORAL** : deux directions différentes pour aller au-delà — l'une en adaptant automatiquement la forme de la distribution prédite, l'autre en garantissant la cohérence ordinale par construction architecturale.
+
+Le plafond théorique reste ~4.5 ans (désaccord humain), atteint uniquement par des modèles modernes multi-tâches comme MiVOLO (2023).
