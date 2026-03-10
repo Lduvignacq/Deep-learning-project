@@ -9,38 +9,33 @@ from torch.utils.tensorboard import SummaryWriter
 from model_aleatoric import get_model_aleatoric
 from dataset import FaceDataset
 
-def get_args():
-    parser = argparse.ArgumentParser(description="Age Estimation with Aleatoric Uncertainty")
-    parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--checkpoint", type=str, default="checkpoint_aleatoric")
-    parser.add_argument("--dist", type=str, default="laplace", choices=['gaussian', 'laplace'])
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    return parser.parse_args()
-
 def aleatoric_loss(mu, log_var, target, dist='laplace'):
     precision = torch.exp(-log_var)
     if dist == 'gaussian':
-        # Loss = 0.5 * exp(-s) * (y-mu)^2 + 0.5 * s
         return (0.5 * precision * (target - mu)**2 + 0.5 * log_var).mean()
-    else: 
-        # Laplace: Loss = exp(-s) * |y-mu| + s
-        return (precision * torch.abs(target - mu) + log_var).mean()
+    # Laplace est souvent plus stable pour l'âge
+    return (precision * torch.abs(target - mu) + log_var).mean()
 
 def train():
-    args = get_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default="checkpoint_aleatoric")
+    parser.add_argument("--dist", type=str, default="laplace")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Init Tensorboard
+    Path(args.checkpoint).mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=args.checkpoint)
+
+    # Utilisation stricte de ta classe FaceDataset
+    train_dataset = FaceDataset(args.data_dir, data_type="train", augment=True)
+    val_dataset = FaceDataset(args.data_dir, data_type="valid", augment=False)
     
-    # Dataset & Model
-    train_dataset = FaceDataset(args.data_dir, mode="train")
-    val_dataset = FaceDataset(args.data_dir, mode="val")
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2)
+
     model = get_model_aleatoric().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
@@ -48,40 +43,37 @@ def train():
 
     for epoch in range(args.epochs):
         model.train()
-        train_loss, train_mae = 0, 0
-        
-        for images, targets in tqdm(train_loader, desc=f"Epoch {epoch}"):
-            images, targets = images.to(device), targets.to(device).float()
-            
+        t_loss, t_mae = 0, 0
+        for imgs, labels in tqdm(train_loader, desc=f"Epoch {epoch}"):
+            imgs, labels = imgs.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            mu, log_var = model(images)
             
-            loss = aleatoric_loss(mu, log_var, targets, dist=args.dist)
+            output = model(imgs)
+            mu, log_var = output[:, 0], output[:, 1]
+            
+            loss = aleatoric_loss(mu, log_var, labels, dist=args.dist)
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item()
-            train_mae += torch.abs(mu - targets).mean().item()
+            t_loss += loss.item()
+            t_mae += torch.abs(mu - labels).mean().item()
 
-        # Validation logic (simplifiée)
+        # Validation
         model.eval()
-        val_mae = 0
+        v_mae = 0
         with torch.no_grad():
-            for images, targets in val_loader:
-                images, targets = images.to(device), targets.to(device).float()
-                mu, _ = model(images)
-                val_mae += torch.abs(mu - targets).mean().item()
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device).float()
+                output = model(imgs)
+                v_mae += torch.abs(output[:, 0] - labels).mean().item()
         
-        val_mae /= len(val_loader)
-        print(f"Epoch {epoch}: Val MAE = {val_mae:.2f}")
-        
-        # Logs
-        writer.add_scalar("MAE/train", train_mae/len(train_loader), epoch)
-        writer.add_scalar("MAE/val", val_mae, epoch)
+        v_mae /= len(val_loader)
+        writer.add_scalar("MAE/val", v_mae, epoch)
+        print(f"Epoch {epoch} - Val MAE: {v_mae:.2f}")
 
-        if val_mae < best_mae:
-            best_mae = val_mae
-            torch.save(model.state_dict(), f"{args.checkpoint}/best_model.pth")
+        if v_mae < best_mae:
+            best_mae = v_mae
+            torch.save({'state_dict': model.state_dict()}, f"{args.checkpoint}/best.pth")
 
 if __name__ == "__main__":
     train()
